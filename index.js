@@ -1,62 +1,70 @@
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason,
-    fetchLatestBaileysVersion,
-    makeCacheableSignalKeyStore
-} = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
 const pino = require("pino");
-const { Boom } = require("@hapi/boom");
 const fs = require("fs");
+const path = require("path");
+
+// 1. Plugins Load කරන Function එක
+const plugins = {};
+const loadPlugins = () => {
+    const pluginFolder = path.join(__dirname, 'plugins');
+    const files = fs.readdirSync(pluginFolder).filter(file => file.endsWith('.js'));
+    for (const file of files) {
+        const plugin = require(path.join(pluginFolder, file));
+        plugins[file.replace('.js', '')] = plugin;
+    }
+    console.log(`✅ ප්ලගින්ස් ${files.length}ක් සාර්ථකව Load වුණා!`);
+};
 
 async function startBloodyRose() {
-    if (!fs.existsSync('./auth_info')) {
-        fs.mkdirSync('./auth_info');
-    }
-
     const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
-    const { version } = await fetchLatestBaileysVersion();
-
     const sock = makeWASocket({
-        version,
         logger: pino({ level: 'silent' }),
+        auth: state,
         printQRInTerminal: false,
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
-        },
         browser: ["Ubuntu", "Chrome", "20.0.04"]
     });
 
-    // 👇 ප්‍රශ්න අහන්නේ නැතුව කෙලින්ම කෝඩ් එක ඉල්ලනවා
+    // Pairing Code එකක් අවශ්‍ය නම් පමණක් පෙන්වයි
     if (!sock.authState.creds.registered) {
-        const phoneNumber = process.env.PHONE_NUMBER; 
-        
-        if (!phoneNumber) {
-            console.log("❌ කරුණාකර 'PHONE_NUMBER' Secret එක GitHub හි ඇතුළත් කරන්න.");
-            process.exit(1);
-        }
-
+        const phoneNumber = process.env.PHONE_NUMBER;
         setTimeout(async () => {
-            try {
-                let code = await sock.requestPairingCode(phoneNumber);
-                code = code?.match(/.{1,4}/g)?.join("-") || code;
-                console.log(`\n\n🔴 ඔබගේ PAIRING CODE එක:  ${code}\n\n`);
-            } catch (err) {
-                console.log("❌ Pairing Code Error: " + err.message);
-            }
-        }, 5000); // තත්පර 5ක් ඉන්න
+            let code = await sock.requestPairingCode(phoneNumber);
+            console.log(`\n🔴 ඔබගේ PAIRING CODE එක: ${code}\n`);
+        }, 5000);
     }
+
+    // ප්ලගින්ස් ටික Load කරන්න
+    loadPlugins();
 
     sock.ev.on('creds.update', saveCreds);
 
+    // මැසේජ් කියවා ප්ලගින් එකට යොමු කිරීම
+    sock.ev.on('messages.upsert', async (chatUpdate) => {
+        const mek = chatUpdate.messages[0];
+        if (!mek.message || mek.key.remoteJid === 'status@broadcast') return;
+
+        const body = mek.message.conversation || mek.message.extendedTextMessage?.text || "";
+        const prefix = "."; // ඔයාගේ බොට්ගේ Prefix එක
+
+        if (body.startsWith(prefix)) {
+            const args = body.slice(prefix.length).trim().split(/ +/);
+            const cmdName = args.shift().toLowerCase();
+
+            // ප්ලගින් එකක් තිබේදැයි පරීක්ෂා කිරීම
+            if (plugins[cmdName]) {
+                try {
+                    await plugins[cmdName].execute(sock, mek, args);
+                } catch (e) {
+                    console.error("Plugin Error: ", e);
+                }
+            }
+        }
+    });
+
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect } = update;
-        if (connection === 'close') {
-            const reason = (lastDisconnect.error instanceof Boom)?.output?.statusCode;
-            if (reason !== DisconnectReason.loggedOut) startBloodyRose();
-        } else if (connection === 'open') {
-            console.log('✅ BLOODY ROSE CONNECTED!');
+        if (connection === 'open') {
+            console.log('✅ BLOODY ROSE CONNECTED & PLUGINS READY!');
         }
     });
 }
